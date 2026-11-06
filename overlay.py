@@ -1,4 +1,4 @@
-"""Five independent, movable buttons attached to the League client window."""
+"""Movable buttons for the client's actual team slots, clipped to visible monitors."""
 import ctypes
 from ctypes import wintypes
 import json
@@ -15,10 +15,36 @@ from PIL import ImageTk
 from app import Worker, CONFIG, BG, CARD, FG, MUTED, BLUE
 from lcu import format_message
 from hextech import HexButton, emblem, make_icon, BG, SURFACE, GOLD, GOLD_DIM, IVORY, CYAN, MUTED, TRANSPARENT
+from layout import default_positions, load_layouts, button_size, place_button
 
 POSITION_FILE = CONFIG.with_name('positions.json')
 user32 = ctypes.windll.user32
 user32.GetForegroundWindow.restype = wintypes.HWND
+user32.GetParent.argtypes = [wintypes.HWND]
+user32.GetParent.restype = wintypes.HWND
+user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                              ctypes.c_int, ctypes.c_int, wintypes.UINT]
+user32.SetWindowPos.restype = wintypes.BOOL
+
+
+def monitor_workareas():
+    class MonitorInfo(ctypes.Structure):
+        _fields_ = [('cbSize', wintypes.DWORD), ('rcMonitor', wintypes.RECT),
+                    ('rcWork', wintypes.RECT), ('dwFlags', wintypes.DWORD)]
+    result = []
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HANDLE, wintypes.HDC,
+                                      ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+    get_info = user32.GetMonitorInfoW
+    get_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
+    def visit(handle, dc, rect, data):
+        info = MonitorInfo()
+        info.cbSize = ctypes.sizeof(info)
+        if get_info(handle, ctypes.byref(info)):
+            r = info.rcWork
+            result.append((r.left, r.top, r.right, r.bottom))
+        return True
+    user32.EnumDisplayMonitors(None, None, callback_type(visit), 0)
+    return result
 
 
 def client_window():
@@ -60,13 +86,14 @@ class Overlay:
         self.worker = Worker(self.events, self.commands, demo)
         self.players = []
         self.pending = False
-        self.positions = [[0.17, 0.19 + i * 0.11] for i in range(5)]
+        self.layouts = {}
+        self.layout_slots = 5
         try:
             saved = json.loads(POSITION_FILE.read_text(encoding='utf-8'))
-            if len(saved) == 5 and all(len(p) == 2 and all(isinstance(v, (float, int)) and 0 <= v <= 1 for v in p) for p in saved):
-                self.positions = saved
+            self.layouts = load_layouts(saved)
         except (OSError, ValueError, TypeError):
             pass
+        self.positions = self.layouts.setdefault('5', default_positions(5))
         self.calibrating = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value='正在连接客户端…')
         self.feedback = tk.StringVar(value='将鼠标移到楼层按钮，查看发送内容')
@@ -74,7 +101,27 @@ class Overlay:
         self.buttons = []
         self.drag = None
         self.anchor = None
-        for i in range(5):
+        self.worker.start()
+        self.root.protocol('WM_DELETE_WINDOW', self.hide_settings)
+        icon_image = make_icon(64)
+        self.tray = pystray.Icon('LOLping', icon_image, 'LOLping · 正在连接', pystray.Menu(
+            pystray.MenuItem('设置 / 连接状态', lambda: self.events.put(('show_settings', None)), default=True),
+            pystray.MenuItem('退出', lambda: self.events.put(('exit', None)))))
+        threading.Thread(target=self.tray.run, daemon=True).start()
+        self.root.after(100, self.tick)
+
+    def sync_buttons(self):
+        slots = max(5, max((p['floor'] for p in self.players), default=0))
+        if slots != self.layout_slots:
+            self.layout_slots = slots
+            self.positions = self.layouts.setdefault(str(slots), default_positions(slots))
+            self.drag = None
+        while len(self.buttons) > len(self.players):
+            win, _ = self.buttons.pop()
+            win.destroy()
+            self.drag = None
+        while len(self.buttons) < len(self.players):
+            i = len(self.buttons)
             win = tk.Toplevel(self.root)
             win.withdraw()
             win.overrideredirect(True)
@@ -88,14 +135,6 @@ class Overlay:
             btn.bind('<ButtonRelease-1>', self.drag_end, add='+')
             btn.bind('<Enter>', lambda e, index=i: self.preview(index), add='+')
             self.buttons.append((win, btn))
-        self.worker.start()
-        self.root.protocol('WM_DELETE_WINDOW', self.hide_settings)
-        icon_image = make_icon(64)
-        self.tray = pystray.Icon('LOLping', icon_image, 'LOLping · 正在连接', pystray.Menu(
-            pystray.MenuItem('设置 / 连接状态', lambda: self.events.put(('show_settings', None)), default=True),
-            pystray.MenuItem('退出', lambda: self.events.put(('exit', None)))))
-        threading.Thread(target=self.tray.run, daemon=True).start()
-        self.root.after(100, self.tick)
 
     def build_settings(self):
         self._window_icon = ImageTk.PhotoImage(make_icon(64), master=self.root)
@@ -175,27 +214,28 @@ class Overlay:
         if not self.calibrating.get():
             try:
                 POSITION_FILE.parent.mkdir(parents=True, exist_ok=True)
-                POSITION_FILE.write_text(json.dumps(self.positions), encoding='utf-8')
+                POSITION_FILE.write_text(json.dumps({'version': 2, 'layouts': self.layouts}), encoding='utf-8')
                 self.feedback.set('位置已保存；点击对应楼层按钮即可发送')
             except OSError:
                 self.feedback.set('位置暂未保存，请检查目录权限')
 
     def reset_positions(self):
-        self.positions = [[0.17, 0.19 + i * 0.11] for i in range(5)]
+        self.positions = default_positions(self.layout_slots)
+        self.layouts[str(self.layout_slots)] = self.positions
         self.save_positions()
 
     def drag_start(self, event, index):
         if self.calibrating.get():
             win = self.buttons[index][0]
-            self.drag = (index, event.x_root - win.winfo_x(), event.y_root - win.winfo_y())
+            self.drag = (self.players[index]['floor'] - 1, event.x_root - win.winfo_x(), event.y_root - win.winfo_y())
             return 'break'
 
     def drag_move(self, event):
         if self.drag and self.anchor:
             i, dx, dy = self.drag
             _, x, y, width, height = self.anchor
-            self.positions[i] = [max(0, min(0.9, (event.x_root-dx-x)/width)),
-                                 max(0, min(0.94, (event.y_root-dy-y)/height))]
+            self.positions[i] = [max(0, min(1, (event.x_root-dx-x)/width)),
+                                 max(0, min(1, (event.y_root-dy-y)/height))]
             return 'break'
 
     def drag_end(self, event):
@@ -257,6 +297,7 @@ class Overlay:
                     return
         except queue.Empty:
             pass
+        self.sync_buttons()
         self.anchor = client_window()
         # Demo also works without a running client, inside a fixed preview rectangle.
         if self.demo and not self.anchor:
@@ -267,26 +308,31 @@ class Overlay:
         visible = self.anchor and (self.demo or foreground == self.anchor[0] or foreground in own_ids)
         visible = visible and bool(self.players)
         remaining = self.worker.limiter.remaining()
+        monitors = monitor_workareas()
         for i, (win, btn) in enumerate(self.buttons):
             if not visible:
                 win.withdraw()
                 continue
             _, x, y, width, height = self.anchor
-            pos = self.positions[i]
-            bw, bh = max(122, round(width*0.09)), max(34, round(height*0.042))
-            px = max(x, min(x+width-bw, x+round(pos[0]*width)))
-            py = max(y, min(y+height-bh, y+round(pos[1]*height)))
-            win.geometry('{}x{}{:+d}{:+d}'.format(bw, bh, px, py))
-            p = self.players[i] if i < len(self.players) else None
+            p = self.players[i]
+            pos = self.positions[p['floor'] - 1]
+            placed = place_button((x, y, width, height), pos,
+                                  button_size(width, height, self.layout_slots), monitors)
+            if placed is None:
+                win.withdraw()
+                continue
+            px, py, bw, bh = placed
             ready = p and p.get('name') and p.get('champion_id') and p.get('conversation')
-            text = '{}楼 · {}'.format(i+1, '拖动定位' if self.calibrating.get() else
+            text = '{}楼 · {}'.format(p['floor'], '拖动定位' if self.calibrating.get() else
                                      '{:.1f}s'.format(remaining) if remaining > 0 else '发送' if ready else '未选择')
             btn.configure(text=text, cooldown=remaining, state='normal' if self.calibrating.get() or (ready and not self.pending and remaining <= 0) else 'disabled')
             if win.state() == 'withdrawn':
+                win.geometry('{}x{}'.format(bw, bh))
                 win.deiconify()
-                # Do not steal keyboard focus from champion select.
-                hwnd = user32.GetParent(win.winfo_id()) or win.winfo_id()
-                user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0013)
+            # Set physical desktop coordinates directly. Tk's negative geometry offsets
+            # mean "from the right/bottom", which is incorrect on negative-coordinate monitors.
+            hwnd = user32.GetParent(win.winfo_id()) or win.winfo_id()
+            user32.SetWindowPos(hwnd, ctypes.c_void_p(-1), px, py, bw, bh, 0x0010)
         self.root.after(100, self.tick)
 
     def close(self):

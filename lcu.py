@@ -150,12 +150,19 @@ class LCU:
 
 
 def selected_players(session):
-    """cellId identifies a team slot; normalize the team's five slots to floors 1-5."""
-    team = sorted(session.get('myTeam') or [], key=lambda p: p['cellId'])
-    return [dict(cell_id=p['cellId'], floor=index + 1,
+    """Preserve vacant floors and support every slot actually reported by myTeam."""
+    team = session.get('myTeam') or []
+    if any(not isinstance(p, dict) or not isinstance(p.get('cellId'), int) or
+           isinstance(p['cellId'], bool) or p['cellId'] < 0 for p in team):
+        raise ClientError('选人楼层数据无效，已停止显示')
+    team = sorted(team, key=lambda p: p['cellId'])
+    if len({p['cellId'] for p in team}) != len(team):
+        raise ClientError('选人楼层重复，已停止显示')
+    base = (team[0]['cellId'] // 5) * 5 if team else 0
+    return [dict(cell_id=p['cellId'], floor=p['cellId'] - base + 1,
                  champion_id=p.get('championId') or p.get('championPickIntent') or 0,
                  is_self=p['cellId'] == session.get('localPlayerCellId'))
-            for index, p in enumerate(team)]
+            for p in team]
 
 
 def format_message(floor, name):
