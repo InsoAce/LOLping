@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+build/
+dist/
+*.spec
+*.png
+*.log
+*.pem
+.env
+.env.*
+!.env.example
+lockfile
+settings.json
+positions.json
+status.json
